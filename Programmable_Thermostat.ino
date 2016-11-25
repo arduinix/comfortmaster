@@ -28,10 +28,15 @@ char ramArray[31];
 int dispMode = 0;
 int cTemp = 0;
 int cHum = 0;
+float calcHum = 0;
+float calcTemp = 0;
 int sTemp = 75;
+int lastTemp = 0;
 String aMode = ""; //0 = off, 2 = heat, 1 = cool
 int mode = 0;
+int lastMode = 0;
 int fanMode = 0; //0 = auto, 1 = manual
+int lastFanMode = 0;
 String sfanMode = "";
 int runMode = 0; //0 = Auto, 1 = Manual, 2 = Temporary Override
 String sRunMode = "";
@@ -45,6 +50,7 @@ long timeDownPress = 0;
 long debounce = 250; //milliseconds that the button must be held to cause an action
 long lastTempPoleTime = 0; //milliseconds since the temperature was last polled
 long tempPoleTime = 10000; //the amount of time to wait between temperature polls
+int tempsPolled = 0;
 int setDayTime = 0; //the time of the day from early morning to evening
 String sSetDayTime = "";
 String sSetDay = "";
@@ -60,17 +66,35 @@ String sTimeMinute = "";
 int dayOfWeek = 0;
 String sDayOfWeek = "";
 int timeOfDay = 0;
+int lastTimeOfDay = 0; //variable to hold the last time of day for switching out of manual mode if in it
 long EEPROMUpdatePeriod = 3600000; //update the EEPROM every hour if there have been changes to the data
 long lastEEPROMUpdateTime = 0;
 long resetPeriod = 2592000000; //the time in milliseconds to perform a soft reset 2592000000 is 30 days
 long timeOverrideEnabled = 0; //a variable to hold the current time in millis that the override was enabled
 long allowedOverrideTime = 3600000; //time in milliseconds that the system will stay in override mode
 long cycleStartTime = 0; //the time in milliseconds that the cycle started
+long currentCycleOnTime = 0; //the time that the on cycle started
+long currentCycleOffTime = 0; //the time the unit has been off since the last on cycle ended
+long minCycleOnTime = 360000; //the time that the unit must be on before and off cycle is allowed this is 6 minutes
+long minCycleOffTime = 600000; //the time that the unit must be on before and on cycle is allowed this is 6 minutes
 long cycleEndTime = 0; //the time in milliseconds that the cycle ended
 long totalCycleTime = 0; //the total amount of cycle time since the last reset
 long averageCycleTime = 0; //the average cycle time since last reset
 int totalCycles = 0; //the total cycles since the last reset
 int sensorCalibration = 0; //the callibration value for the temperature sensor
+long lastTimeUpdateTime = 0; //counter to reduce the load on the RTC
+long clockUpdateTime = 20000; //how often to get a time burst from the real time clock 20000 is 20 seconds
+int currentCycleCount = 0;
+boolean modeOrTempChanged = false;
+long modeOrTempChangedTime = 0;
+long changeBufferTime = 10000;
+boolean currentlyWritingtoEEPROM = false;
+boolean currentlyReadingFromEEPROM = false;
+boolean currentlyWritingEEPROMQuick = false;
+long heatRuntimeBeforeFanCycle = 20000; //the number of milliseconds that the system is in heat mode before the blower is triggered to run for its set period of time
+long fanRunTimeOnLongHeatCycle = 30000; //the number of milliseconds that the fan should run if the heat is running for a long time to help with circulation during hard warm ups
+long fanRunTimeOnLongHeatCycleStartTime = 0; //the time that the long heat fan cycle started
+boolean fanRunEventTriggered = false;
 
 //variables for the temperature sensor
 int dht11Chk = 0;
@@ -78,10 +102,13 @@ int dht11Gnd = 29;
 int dht11Vcc = 23;
 int dht11Data = 25;
 
-//variables for control relays
+//variables for control relay pins
 int fanRelayPin = 50;
 int heatRelayPin = 52;
 int coolRelayPin = 48;
+
+//variables for RTC power pins
+int rtcVcc = 46; 
 
 //array to hold the set temperatures 0 = earlyMorning, 1 = lateMorning, 2 = afternoon, 3 = evening, 4 = night
 //earlyMorning = 04:31 - 08:00
@@ -109,10 +136,20 @@ int setTemps[8][5] = {
   {55, 55, 55, 55, 55 }
 };
 
-//declare variables for mode and fan control
+//array to hold the days of the week
+String daysOfWeekMap[8] = {"BLK", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-boolean overrideSel = false;
-boolean fanModeAuto = true;
+//array to hold the day times string map
+String setDayTimeMap[5] = {"EMorning", "LMorning", "AftrNoon", "Evening ", "Night   "};
+
+//array to hold the modes
+String modesMap[3] = {"Off", "Cool", "Heat"};
+
+//array to hold the fan modes map
+String fanModesMap[2] = {"AT", "ON"};
+
+//array to hold the runModesMap
+String runModesMap[3] = {"Auto", "Manu", "OvRd"};
 
 // define some values used by the panel and buttons
 int lcd_key     = 0;
@@ -157,6 +194,15 @@ int read_LCD_buttons(){               // read the buttons
 
 void setup(){
 
+    //set up the rtc vcc pin
+    pinMode(rtcVcc, OUTPUT);
+    digitalWrite(rtcVcc, LOW);
+    delay(100);
+    //power cycle the rtc
+    digitalWrite(rtcVcc, HIGH);
+    delay(100);
+
+    //start the serial port if it is available
     Serial.begin(9600);
     delay(100);
     
@@ -169,8 +215,6 @@ void setup(){
     setSyncProvider(RTC.get); 
     printMenu();
 
-
-    
     //set up for the dht11 temperature sensor
     pinMode(dht11Gnd, OUTPUT);
     digitalWrite(dht11Gnd, LOW);
@@ -205,18 +249,22 @@ void setup(){
    cTemp = DHT11.fahrenheit();
    cHum = DHT11.humidity;
    lastTempPoleTime = millis();
+
+   //get the initial time from the rtc
+   t = now();
+   updateStringTime(t);
+   lastTimeUpdateTime = millis();
+
+   //perform the intial setup of the last modes and temps
+   lastFanMode = fanMode;
+   lastMode = mode;
+   lastTemp = sTemp;
+   lastTimeOfDay = timeOfDay;
 }
  
 void loop(){
-   //get the temperature from the dht11 temperature sensor
-   if(millis() - lastTempPoleTime > tempPoleTime)
-   {
-    dht11Chk = DHT11.read();
-    cTemp = DHT11.fahrenheit();
-    cHum = DHT11.humidity;
-    lastTempPoleTime = millis();
-    cTemp = cTemp + sensorCalibration;
-   }
+   //call the function to update the temperature
+   updateCurrentTemperature();
    
    //read the buttons on the lcd panel
    lcd_key = read_LCD_buttons();   // read the buttons
@@ -409,8 +457,12 @@ void loop(){
    }
 
   //update the time string
-  t = now();
-  updateStringTime(t);
+  if (millis() - lastTimeUpdateTime >= clockUpdateTime)
+  {
+    t = now();
+    updateStringTime(t);
+    lastTimeUpdateTime = millis();
+  }
   
   //switch the display mode
   switch (dispMode){
@@ -547,104 +599,19 @@ void loop(){
   }
 
   //map the string set day time to the actual time of day being set
-  switch (setDayTime){
-      case 0:{
-        sSetDayTime = "EMorning";
-        break;
-      }
-      case 1:{
-        sSetDayTime = "LMorning";
-        break;
-      }
-      case 2:{
-        sSetDayTime = "AftrNoon";
-        break;
-      }
-      case 3:{
-        sSetDayTime = "Evening ";
-        break;
-      }
-      case 4:{
-        sSetDayTime = "Night   ";
-        break;
-      }
-    }
-    //map the string for the current day to the day of the week
-    switch (dayOfWeek){
-      case 1:{
-        sDayOfWeek = "Sun";
-        break;
-      }
-      case 2:{
-        sDayOfWeek = "Mon";
-        break;
-      }
-      case 3:{
-        sDayOfWeek = "Tue";
-        break;
-      }
-      case 4:{
-        sDayOfWeek = "Wed";
-        break;
-      }
-      case 5:{
-        sDayOfWeek = "Thu";
-        break;
-      }
-      case 6:{
-        sDayOfWeek = "Fri";
-        break;
-      }
-      case 7:{
-        sDayOfWeek = "Sat";
-        break;
-      }
-    }
+  sSetDayTime = setDayTimeMap[setDayTime];
+  
+  //map the string for the current day to the day of the week
+  sDayOfWeek = daysOfWeekMap[dayOfWeek];
 
+  //map the string for operational mode
+  aMode = modesMap[mode];
 
-    //map for the operational mode
-    switch (mode){
-      case 0:{
-        aMode = "Off ";
-        break;
-      }
-      case 1:{
-        aMode = "Cool";
-        break;
-      }
-      case 2:{
-        aMode = "Heat";
-        break;
-      }
-    }
+  //map for the fan mode
+  sfanMode = fanModesMap[fanMode];
 
-    //map for the fan mode
-    switch (fanMode){
-      case 0:{
-        sfanMode = "AT";
-        break;
-      }
-      case 1:{
-        sfanMode = "ON";
-        break;
-      }
-    }
-
-    //map for the run mode
-    switch (runMode){
-      case 0:{
-        sRunMode = "Auto";
-        break;
-      }
-      case 1:{
-        sRunMode = "Manu";
-        break;
-      }
-       case 2:{
-        sRunMode = "OvRd";
-        break;
-      }
-    }
+  //map for the run mode
+  sRunMode = runModesMap[runMode];
 
     //call the function to control the fan state
     controlFan();
@@ -652,6 +619,8 @@ void loop(){
     controlHeat();
     //call the function to set the temperature for auto mode
     setTemperature();
+    //call function to track the modes or temperature
+    trackModesTemp();
 
     //auto write the data to the EEPROM
     if(millis()- lastEEPROMUpdateTime >= EEPROMUpdatePeriod)
@@ -674,14 +643,15 @@ void loop(){
       softReset();
     }
 
+    //this is now taken care of in the set temperature function the override is only disabled if the next part of the day has started
     //clear the override if approriate time has elapsed
-    if (runMode == 2)
-    {
-      if (millis() - timeOverrideEnabled >= allowedOverrideTime)
-      {
-        runMode = 0;
-      }
-    }
+    //if (runMode == 2)
+    //{
+    //  if (millis() - timeOverrideEnabled >= allowedOverrideTime)
+    //  {
+    //    runMode = 0;
+    //  }
+    //}
 
 
     //code for the RTC Module Management
@@ -764,85 +734,144 @@ void printDayLCD()
       
 }
 
-void writeDataToEEPROM()
+void writeDataToEEPROMQuick()
 {
-  //update the lcd
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Writing...");
-  
-  EEPROM.update(0, sTemp);
-  delay(10);
-  EEPROM.update(1, mode);
-  delay(10);
-  EEPROM.update(2, (sensorCalibration + 128));//add 128 when writing so that the unit can store negative values
-  delay(10);
-  EEPROM.update(3, fanMode);
-  delay(10);
-  EEPROM.update(4, runMode);
-  delay(10);
-  
-  int z = 10;
-  for(int x=1; x <= 7; x++)
+  if (!currentlyWritingtoEEPROM && !currentlyReadingFromEEPROM)
   {
-    for(int y=0; y <= 4; y++)
-    {
-      EEPROM.update(z, setTemps[x][y]);
-      delay(10);
-      z++;
-    }
+    currentlyWritingEEPROMQuick = true;
+    EEPROM.update(0, sTemp);
+    delay(5);
+    EEPROM.update(1, mode);
+    delay(5);
+    EEPROM.update(2, (sensorCalibration + 128));//add 128 when writing so that the unit can store negative values
+    delay(5);
+    EEPROM.update(3, fanMode);
+    delay(5);
+    EEPROM.update(4, runMode);
+    delay(5);
+    currentlyWritingEEPROMQuick = false;
   }
+}
 
-  //update the lcd
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Done Writing");
-  lcd.setCursor(0,1);
-  lcd.print("Press Select");
-
-  //read the data back from the EEPROM
-  readDataFromEEPROM();
-  dispMode = 0;
+void writeDataToEEPROM()
+{ 
+  if (!currentlyWritingEEPROMQuick)
+  {
+    currentlyWritingtoEEPROM = true;
+    //update the lcd
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Writing...");
+    
+    EEPROM.update(0, sTemp);
+    delay(10);
+    EEPROM.update(1, mode);
+    delay(10);
+    EEPROM.update(2, (sensorCalibration + 128));//add 128 when writing so that the unit can store negative values
+    delay(10);
+    EEPROM.update(3, fanMode);
+    delay(10);
+    EEPROM.update(4, runMode);
+    delay(10);
+    
+    int z = 10;
+    for(int x=1; x <= 7; x++)
+    {
+      for(int y=0; y <= 4; y++)
+      {
+        EEPROM.update(z, setTemps[x][y]);
+        delay(10);
+        z++;
+      }
+    }
+  
+    //update the lcd
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Done Writing");
+    lcd.setCursor(0,1);
+    lcd.print("Press Select");
+  
+    //read the data back from the EEPROM
+    readDataFromEEPROM();
+    dispMode = 0;
+  
+    currentlyWritingtoEEPROM = false;
+  }
 }
 
 void readDataFromEEPROM()
-{
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.write("Reading EEPROM");
-  lcd.setCursor(0,1);
-  lcd.print("Please Wait");
-  
-  sTemp = EEPROM.read(0);
-  delay(10);
-  mode = EEPROM.read(1);
-  delay(10);
-  sensorCalibration = EEPROM.read(2);
-  delay(10);
-  sensorCalibration -= 128; //subtract 128 from the value stored in the EEPROM because we can't store negative values there
-  fanMode  = EEPROM.read(3);
-  delay(10);
-  runMode = EEPROM.read(4);
-  delay(10);
-  
-  int z = 10;
-  for(int x=1; x <= 7; x++)
+{ if (!currentlyWritingEEPROMQuick)
   {
-    for(int y=0; y <=4; y++)
+    currentlyReadingFromEEPROM = true;
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.write("Reading EEPROM");
+    lcd.setCursor(0,1);
+    lcd.print("Please Wait");
+    
+    sTemp = EEPROM.read(0);
+    delay(10);
+    mode = EEPROM.read(1);
+    delay(10);
+    sensorCalibration = EEPROM.read(2);
+    delay(10);
+    sensorCalibration -= 128; //subtract 128 from the value stored in the EEPROM because we can't store negative values there
+    fanMode  = EEPROM.read(3);
+    delay(10);
+    runMode = EEPROM.read(4);
+    delay(10);
+    
+    int z = 10;
+    for(int x=1; x <= 7; x++)
     {
-      setTemps[x][y] = EEPROM.read(z);
-      delay(10);
-      z++;
+      for(int y=0; y <=4; y++)
+      {
+        setTemps[x][y] = EEPROM.read(z);
+        delay(10);
+        z++;
+      }
     }
+  
+    lcd.clear();
+    currentlyReadingFromEEPROM = false;
+  }
+}
+
+//function to track the modes and temps
+void trackModesTemp()
+{
+  if (fanMode != lastFanMode || mode != lastMode || sTemp != lastTemp)
+  {
+    modeOrTempChanged = true;
+    modeOrTempChangedTime = millis();
   }
 
-  lcd.clear();
+  if (modeOrTempChanged && millis() - modeOrTempChangedTime >= changeBufferTime)
+  {
+    modeOrTempChanged = false;
+
+    //check if we are in mode 0 and if so do not change the times
+    if (runMode > 0)
+    {
+      //adjust the cycle times
+      cycleEndTime = millis() - minCycleOffTime;
+      cycleStartTime = millis() - minCycleOnTime;
+    }
+    
+    //write to eeprom
+    writeDataToEEPROMQuick();
+  }
+
+  lastFanMode = fanMode;
+  lastMode = mode;
+  lastTemp = sTemp;
 }
 
 //function to control the fan state
 void controlFan()
 {
-  if (fanMode == 1)
+  if (fanMode == 1 || fanMode == 2)
   {
     //turn the fan on
     digitalWrite(fanRelayPin, LOW);
@@ -850,6 +879,26 @@ void controlFan()
   else
   {
     digitalWrite(fanRelayPin, HIGH);
+  }
+
+  //determine if the heat has been on for long enough to elicit the fan coming on to circulate
+  if (currentCycleOnTime >= heatRuntimeBeforeFanCycle && !fanRunEventTriggered)
+  {
+    //fanMode = 2;
+    fanRunTimeOnLongHeatCycleStartTime = millis();
+    fanRunEventTriggered = true;
+    
+  }
+  if (fanRunEventTriggered)
+  {
+    //check if the appropriate time has elapsed before turning off the fan
+    if (millis() - fanRunTimeOnLongHeatCycleStartTime >= fanRunTimeOnLongHeatCycle)
+    {
+      //set the fan back to automatic mode
+      //fanMode = 0;
+      fanRunEventTriggered = false;
+    }
+    
   }
 }
 
@@ -859,32 +908,50 @@ void controlHeat()
   //check if the thermostat is in heat mode 
   if(mode == 2 && dht11Chk == 0)
   {
+    //artificially set the cycle off time if there have been no cycles so far
+    if (currentCycleCount < 1)
+    {
+      cycleEndTime = millis() - minCycleOffTime;
+    }
+
     if (heating)
     {
+      //update the current cycle on time
+      currentCycleOnTime = millis() - cycleStartTime;
+      
       //check the temperature and see if we can end the call for heat
       if (cTemp >= (sTemp + tVariance))
       {
-        //turn off the heat
-        digitalWrite(heatRelayPin, HIGH);
-        heating = false;
-
-        //calcuate the average cycle time
-        cycleEndTime = millis();
-        totalCycleTime += cycleEndTime - cycleStartTime;
-        totalCycles ++;
-        averageCycleTime = (totalCycleTime / totalCycles) / 60000;
-        
+        if (currentCycleOnTime >= minCycleOnTime)
+        {
+          //turn off the heat
+          digitalWrite(heatRelayPin, HIGH);
+          heating = false;
+  
+          //calcuate the average cycle time
+          cycleEndTime = millis();
+          totalCycleTime += cycleEndTime - cycleStartTime;
+          totalCycles ++;
+          averageCycleTime = (totalCycleTime / totalCycles) / 60000;
+          currentCycleCount++;
+        }
       }
     }
     else
-    {
+    { 
+      //update the cycle off time
+      currentCycleOffTime = millis() - cycleEndTime;
+      
       //check the temperature and see if we need to turn on the heat
       if (cTemp <= (sTemp - tVariance))
       {
-        //turn on the heat
-        digitalWrite(heatRelayPin, LOW);
-        cycleStartTime = millis();
-        heating = true;
+        if (currentCycleOffTime >= minCycleOffTime)
+        {
+          //turn on the heat
+          digitalWrite(heatRelayPin, LOW);
+          cycleStartTime = millis();
+          heating = true;
+        }
       }
     }
   }
@@ -894,8 +961,36 @@ void controlHeat()
   {
     digitalWrite(heatRelayPin, HIGH);
     heating = false;
+    cycleEndTime = millis();
+    cycleStartTime = 0;
+    currentCycleCount = 0;
   }
   
+}
+
+//function to update the current temperature
+void updateCurrentTemperature()
+{
+  //get a temperature from the dht11 temperature sensor
+   if(millis() - lastTempPoleTime >= tempPoleTime)
+   {
+    dht11Chk = DHT11.read();
+    calcTemp += DHT11.fahrenheit();
+    calcHum += DHT11.humidity;
+    lastTempPoleTime = millis();
+    tempsPolled++;
+   }
+   if (tempsPolled >= 6)
+   {
+     //calculate the average temperature over 3 times the temp pole time
+     calcHum = calcHum / tempsPolled;
+     calcTemp = calcTemp / tempsPolled;
+     cHum = calcHum;
+     cTemp = calcTemp + sensorCalibration;
+     tempsPolled = 0;
+     calcTemp = 0;
+     calcHum = 0;
+   }
 }
 
 //function to set the temperature if in automatic mode
@@ -933,6 +1028,20 @@ void setTemperature()
   {
     sTemp = setTemps[dayOfWeek][timeOfDay];
   }
+
+  //check the last time of day and take the run mode out of overide if in it
+  if (timeOfDay != lastTimeOfDay)
+  {
+    //if we are running in override mode
+     if(runMode == 2)
+     {
+        //take us out of override mode at the next time of day
+        runMode = 0;
+     }
+  }
+
+  //update the last time of day
+  lastTimeOfDay = timeOfDay;
   
 }
 void printMenu(){
